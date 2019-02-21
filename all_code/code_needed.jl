@@ -6,10 +6,9 @@ using MatrixNetworks
 using MatrixNetworks
 using StatsBase
 using Plots
-using StatPlots
-include("triangles.jl")
+using StatsPlots
 include("find_triangles.jl")
-using PyCall; pyplot()
+using PyCall
 
 import SparseArrays.spzeros
 
@@ -274,25 +273,104 @@ function SBM_double_seed_idea(
     return all_aucs_new
 end
 
-function double_seed(
-  A::SparseMatrixCSC{Int64,Int64},
-  v1::Int,
-  v2::Int,
-  myalpha::Float64 #PageRank's alpha
-  )
+sample_experiment_ids(experiments_to_run::Int,total_experiments::Int) = sample(1:total_experiments,experiments_to_run,replace=false)
 
-  v = spzeros(size(A,2))
-  vi = copy(v)
-  vj = copy(v)
 
-  v[v1] = 0.5
-  v[v2] = 0.5
-  vi[v1] = 1
-  vj[v2] = 1
 
-  xsol = seeded_pagerank(A,myalpha,v)
-  xsol1 = seeded_pagerank(A,myalpha,vi)
-  xsol2 = seeded_pagerank(A,myalpha,vj)
 
-  return xsol,xsol1,xsol2
+# function double_seed(
+#   A::SparseMatrixCSC{Int64,Int64},
+#   v1::Int,
+#   v2::Int,
+#   myalpha::Float64, #PageRank's alpha
+#   method::String
+#   )
+
+#   v = spzeros(size(A,2))
+#   vi = copy(v)
+#   vj = copy(v)
+
+#   v[v1] = 0.5
+#   v[v2] = 0.5
+#   vi[v1] = 1
+#   vj[v2] = 1
+
+#   if method == "heatkernel"
+#     xsol = seeded_stochastic_heat_kernel(MatrixNetwork(A),15.,v)
+#     xsol1 = seeded_stochastic_heat_kernel(MatrixNetwork(A),15.,vi)
+#     xsol2 = seeded_stochastic_heat_kernel(MatrixNetwork(A),15.,vj)
+#   elseif method == "pagerank"
+#     xsol = seeded_pagerank(A,myalpha,v)
+#     xsol1 = seeded_pagerank(A,myalpha,vi)
+#     xsol2 = seeded_pagerank(A,myalpha,vj)
+#   else
+#     error("method should be heatkernel or pagerank")
+#   end
+
+#   return xsol,xsol1,xsol2
+# end
+
+# double_seed(A::SparseMatrixCSC{Int64,Int64},v1::Int,v2::Int,myalpha::Float64) = double_seed(A,v1,v2,myalpha,"pagerank")
+
+# function collapse_network(A)
+#   # tao = 0.8
+#   # myalpha = 0.8
+#   # i1,j1,TR = find_edges_of_tris(M);
+#   ei = Array{Int64}(undef,0)
+#   ej = Array{Int64}(undef,0)
+#   n = size(A,1)
+#   # new dimension is n^2 + n
+#   mytriangles = triangles(A;symmetries = true)
+#   for tri in mytriangles
+#     r,c,k = tri.v,tri.w,tri.x
+#     node1 = n*(c-1) + r
+#     node2 = n^2 + k
+#     push!(ei,node1)
+#     push!(ej,node2)
+#   end
+#   triangles_collapsed = sparse(ei,ej,1,n^2+n,n^2+n)
+#   triangles_collapsed = max.(triangles_collapsed,triangles_collapsed')
+#   return triangles_collapsed
+# end
+
+function _normout_rowstochastic(P::SparseArrays.SparseMatrixCSC{T,Int64}) where T
+  n = size(P,1)
+  colsums = sum(P,dims=2)
+  pi,pj,pv = findnz(P)
+  Q = SparseMatrixCSC(P.m,P.n,P.colptr,P.rowval,pv./colsums[pi])
 end
+function _normout_colstochastic(P::SparseArrays.SparseMatrixCSC{T,Int64}) where T
+  n = size(P,1)
+  colsums = sum(P,dims=2)
+  pi,pj,pv = findnz(P)
+  Q = SparseMatrixCSC(P.m,P.n,P.colptr,P.rowval,pv./colsums[pj])
+end
+
+# ,seedon)
+#   for v in seedon
+#     xsol = seeded_pagerank(triangles_collapsed,myalpha,v)
+#   end
+
+
+
+# TR = spones(TR)
+# nrows,ncols = size(TR)
+# C = vcat(
+#         hcat(spzeros(Int64,nrows,nrows),TR),
+#         hcat(TR',spzeros(Int64,ncols,ncols))
+#         )
+
+
+# Mtrain,Mtest = split_train_test(C,tao);
+# Ctest = Mtest[nrows+1:end,1:nrows]
+
+
+# seedon = 1:nrows
+
+# X = zeros(Float64,ncols,length(seedon));
+
+# for i = 1:length(seedon)
+#   X[:,i] = seeded_pagerank(Mtrain,myalpha,seedon[i])[nrows+1:end]
+# end
+# tpr2,fpr2,auc2 = calc_AUC_new(Ctest,X); @show auc2
+# end
