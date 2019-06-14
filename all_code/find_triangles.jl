@@ -12,8 +12,6 @@ struct graph_triangle
     node3::Int
 end
 
-
-
 function find_triangles(A::MatrixNetwork,weighted::Bool,normalized::Bool)
     donorm = true
     usew = true

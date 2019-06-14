@@ -7,8 +7,13 @@ using MatrixNetworks
 using StatsBase
 using Plots
 using StatsPlots
+using Statistics
+using UnicodePlots
 include("find_triangles.jl")
 using PyCall
+
+isnotnan = !isnan
+isconnected(A) = scomponents(A).sizes[1] == size(A,1)
 
 import SparseArrays.spzeros
 
@@ -88,7 +93,7 @@ function ismember(A::Array{T,2},x::Vector{T},dims::Int) where T
 end
 
 @pyimport sklearn.metrics as metrics
-function calc_AUC_new(Rtest,Xa)
+function calc_AUC_pycall(Rtest,Xa)
   Rtest = vec(Rtest)
   Xa = vec(Xa)
   minNonZero = minimum(abs.(Xa[findall(Xa.!=0)]))
@@ -97,6 +102,44 @@ function calc_AUC_new(Rtest,Xa)
   auc = metrics.auc(fpr,tpr)
   return tpr,fpr,auc
 end
+
+using MLBase
+function calc_AUC_new(xref,xresult) #xref is ground truth
+    r = MLBase.roc(xref,xresult)
+    fpr = zeros(length(r))
+    tpr = zeros(length(r))
+    for i = length(r):-1:1
+        fpr[length(r)-i+1] = false_positive_rate(r[i])
+        tpr[length(r)-i+1] = true_positive_rate(r[i])
+    end
+    aucv = 0
+    for i = 1:length(fpr)-1
+        aucv = aucv + (fpr[i+1] - fpr[i])*(tpr[i] + tpr[i+1])/2
+    end
+    return tpr,fpr,aucv
+end
+
+function calc_triangle_closing_percent(x,k,i,j,addednodes,Ar)
+    sorted_preds = sortperm(x,rev=true).+addednodes
+    ci = zeros(length(x))
+    for ki = 1:length(x)
+        nki = sorted_preds[ki]
+        ci[ki] = close_triangles(i,nki,Ar)
+    end
+
+    di = zeros(length(x))
+    for ki = 1:length(x)
+        nki = sorted_preds[ki]
+        di[ki] = close_triangles(j,nki,Ar)
+    end
+    t1 = sum(ci[1:k])/(2*sum(ci))
+
+    t2 = sum(di[1:k])/(2*sum(di))
+
+    tri_percent = t1+t2
+    return t1,t2,tri_percent
+end
+
 using Random
 function split_train_test(R::SparseMatrixCSC{T,Int64},rho::Float64) where T
     if !(0<=rho<=1)
@@ -119,6 +162,316 @@ function split_train_test(R::SparseMatrixCSC{T,Int64},rho::Float64) where T
     Rtest = max.(Rtest,Rtest')
     return Rtrain,Rtest
 end
+
+function split_train_test_keep_many_wedges(R,tao)
+    if !(0<=tao<=1)
+      error("function split_train_test: rho must be between 0 and 1. Read `? split_train_test` for more")
+    end
+    n = size(R,1)
+    A = copy(R)
+    A2 = A*A # length2 network
+    A2 = A2-Diagonal(A2)
+    T = spones(A2.*A) #every edge that is part of at least one triangle
+    F = A-T # 1 if edge is part of no triangle at all
+    Ftrain,Ftest = split_train_test(F,tao)
+    # Ttrain,Ttest,Edges = split_train_test_keep_connected_wedges_helper(T,tao)
+    # return Ttrain+Ftrain,Ttest+Ftest,Edges
+    # A = A-Ftest
+    Ctrain = spzeros(Int,size(A)...)
+    Ctest = spzeros(Int,size(A)...)
+    # @show nnz(Ftrain)/nnz(F)
+
+    tris = collect(triangles(A))
+
+    len = length(tris)
+    seed = time()
+    r = MersenneTwister(round(Int64,seed))
+    a = randperm(r,len)
+    nz = ceil(Int,tao/4*len)
+    tris = tris[a]#[1:nz]
+    
+    # eitest = zeros(Int,2nz)
+    # ejtest = zeros(Int,2nz)
+
+    test_edge_count = 1
+    opt = floor(Int,0.2*(nnz(R)/2) - nnz(Ftest)/2)
+    @show opt
+    for curtri_id = 1:length(tris)
+        if test_edge_count > opt
+            break
+        end
+        v1,v2,v3 = tris[curtri_id]
+
+        # make sure it is still a triangle
+        # if !(A[v1,v2] !=1 || A[v1,v3] != 1 || A[v2,v3] != 1)
+        # ei1 = v1
+        # ej1 = v2
+        # ek1 = v3
+        C = Ctrain+Ctest
+        mys = [C[v1,v2],C[v2,v3],C[v1,v3]]
+        # @show sum(mys)
+        if sum(mys) == 0 # cases 0,1 # none of the three nodes were previously touched
+            Ctrain[v1,v2] = 1
+            Ctest[v2,v3] = 1; test_edge_count += 1
+            Ctest[v1,v3] = 1; test_edge_count += 1
+        elseif sum(mys) == 2 # two edges have been touched, only care about the case when both are in test
+            mytest = [Ctest[v1,v2],Ctest[v2,v3],Ctest[v1,v3]]
+            if sum(mytest) == 2
+            cc = findfirst(mys.==0)
+            if cc == 1
+                Ctrain[v1,v2] = 1
+                #v1,v2 train
+                # Ctest[v2,v3] = 1
+                # Ctest[v1,v3] = 1
+            elseif cc == 2
+                Ctrain[v2,v3] = 1
+                # Ctest[v1,v2] = 1
+                # Ctest[v1,v3] = 1
+            elseif cc == 3
+                Ctrain[v1,v3] = 1
+                # Ctest[v1,v2] = 1
+                # Ctest[v2,v3] = 1
+            end
+        end
+        elseif sum(mys) == 1 #case 2 # only one edge has been used, 
+            mytest = [Ctest[v1,v2],Ctest[v2,v3],Ctest[v1,v3]]
+            cc = findfirst(mys.==1)
+            if sum(mytest) == 1
+            if cc == 1
+                Ctrain[v2,v3] = 1
+                Ctest[v1,v3] = 1; test_edge_count += 1
+            elseif cc == 2
+                Ctrain[v1,v2] = 1
+                Ctest[v1,v3] = 1; test_edge_count += 1
+            elseif cc == 3
+                Ctrain[v1,v2] = 1
+                Ctest[v2,v3] = 1; test_edge_count += 1
+            end
+            else
+            if cc == 1
+                Ctest[v2,v3] = 1; test_edge_count += 1
+                Ctest[v1,v3] = 1; test_edge_count += 1
+            elseif cc == 2
+                Ctest[v1,v2] = 1; test_edge_count += 1
+                Ctest[v1,v3] = 1; test_edge_count += 1
+            elseif cc == 3
+                Ctest[v1,v2] = 1; test_edge_count += 1
+                Ctest[v2,v3] = 1; test_edge_count += 1
+            end
+        end
+
+        end
+        # if sum(mys) == 3 # everything is in training
+        Ctrain = max.(Ctrain,Ctrain')
+        Ctest = max.(Ctest,Ctest')
+    end
+    @show test_edge_count
+    ei,ej,ev = findnz(triu(Ctrain))
+    Edges = hcat(ei,ej)
+    Mtrain = A-Ftest-Ctest
+    Mtest = Ftest+Ctest
+    return Mtrain,Mtest,Edges
+
+end
+
+function split_train_test_keep_connected_wedges_helper(R::SparseMatrixCSC{T,Int64},rho::Float64) where T
+    if !(0<=rho<=1)
+      error("function split_train_test: rho must be between 0 and 1. Read `? split_train_test` for more")
+    end
+    
+    m,n = size(R)
+    ei,ej,ev = findnz(triu(R))
+    tris = collect(triangles(R))
+    len = length(ev)
+    seed = time()
+    r = MersenneTwister(round(Int64,seed))
+    a = randperm(r,len)
+    nz = ceil(Int,(1-rho)*len)
+    trirand = randperm(r,length(tris))
+
+    if isodd(nz)
+        nz -=1
+    end
+    eitest = zeros(Int,nz)
+    ejtest = zeros(Int,nz)
+
+    test_edge_count = 1
+    icounter = 1
+    A = copy(R)
+    @show nz
+    while icounter < len && test_edge_count <= nz 
+        # add a new edge to test
+        v1,v2,v3 = tris[trirand[icounter]]
+        # make sure it is still a triangle
+        if !(A[v1,v2] !=1 || A[v1,v3] != 1 || A[v2,v3] != 1)
+        ei1 = v1
+        ej1 = v2
+        ek1 = v3
+
+        #drop 4 edges
+        A[ei1,ej1] = 0
+        A[ej1,ei1] = 0
+
+        A[ei1,ek1] = 0
+        A[ek1,ei1] = 0
+
+        dropzeros!(A)
+        # if isconnected(A)
+            #add to test
+            eitest[test_edge_count] = ei1
+            ejtest[test_edge_count] = ej1
+            test_edge_count += 1
+
+            eitest[test_edge_count] = ei1
+            ejtest[test_edge_count] = ek1
+            test_edge_count += 1
+        # else
+            # A[ei1,ej1] = 1
+            # A[ej1,ei1] = 1
+
+            # A[ei1,ek1] = 1
+            # A[ek1,ei1] = 1
+        # end
+        end
+        icounter += 1
+    end
+    @show test_edge_count-1
+    @show nz
+    eitest = eitest[1:test_edge_count-1]
+    ejtest = ejtest[1:test_edge_count-1]
+    Atest = sparse(eitest,ejtest,1,m,n)
+    Atest = max.(Atest,Atest')
+    Edges1 = eitest[2:2:end]
+    Edges2 = ejtest[2:2:end]
+    Edges = hcat(Edges1,Edges2)
+    return A,Atest,Edges
+end
+
+
+function split_train_test_keep_connected_wedges(R::SparseMatrixCSC{T,Int64},rho::Float64) where T
+    if !(0<=rho<=1)
+      error("function split_train_test: rho must be between 0 and 1. Read `? split_train_test` for more")
+    end
+    
+    m,n = size(R)
+    ei,ej,ev = findnz(triu(R))
+    tris = collect(triangles(R))
+    tris = tris[randperm(length(tris))]
+    len = length(ev)
+    seed = time()
+    r = MersenneTwister(round(Int64,seed))
+    a = randperm(r,len)
+    nz = ceil(Int,(1-rho)*len)
+
+    if isodd(nz)
+        nz -=1
+    end
+    eitest = zeros(Int,nz)
+    ejtest = zeros(Int,nz)
+
+    test_edge_count = 1
+    icounter = 1
+    A = copy(R)
+    @show nz
+    while icounter < len && test_edge_count <= nz 
+        # add a new edge to test
+        v1,v2,v3 = tris[icounter]
+        # make sure it is still a triangle
+        if !(A[v1,v2] !=1 || A[v1,v3] != 1 || A[v2,v3] != 1)
+        ei1 = v1
+        ej1 = v2
+        ek1 = v3
+
+        #drop 4 edges
+        A[ei1,ej1] = 0
+        A[ej1,ei1] = 0
+
+        A[ei1,ek1] = 0
+        A[ek1,ei1] = 0
+
+        dropzeros!(A)
+        if isconnected(A)
+            #add to test
+            eitest[test_edge_count] = ei1
+            ejtest[test_edge_count] = ej1
+            test_edge_count += 1
+
+            eitest[test_edge_count] = ei1
+            ejtest[test_edge_count] = ek1
+            test_edge_count += 1
+        else
+            A[ei1,ej1] = 1
+            A[ej1,ei1] = 1
+
+            A[ei1,ek1] = 1
+            A[ek1,ei1] = 1
+        end
+        end
+        icounter += 1
+    end
+    @show test_edge_count-1
+    @show nz
+    eitest = eitest[1:test_edge_count-1]
+    ejtest = ejtest[1:test_edge_count-1]
+    Atest = sparse(eitest,ejtest,1,m,n)
+    Atest = max.(Atest,Atest')
+    return A,Atest
+end
+
+
+function split_train_test_keep_connected(R::SparseMatrixCSC{T,Int64},rho::Float64) where T
+    if !(0<=rho<=1)
+      error("function split_train_test: rho must be between 0 and 1. Read `? split_train_test` for more")
+    end
+    
+    m,n = size(R)
+    ei,ej,ev = findnz(triu(R))
+    len = length(ev)
+    seed = time()
+    r = MersenneTwister(round(Int64,seed))
+    a = randperm(r,len)
+    nz = ceil(Int,(1-rho)*len)
+
+    eitest = zeros(Int,nz)
+    ejtest = zeros(Int,nz)
+
+    test_edge_count = 1
+    icounter = 1
+    A = copy(R)
+    while icounter < len && test_edge_count <= nz 
+        # add a new edge to test
+        ei1 = ei[a[icounter]]
+        ej1 = ej[a[icounter]]
+        A[ei1,ej1] = 0
+        A[ej1,ei1] = 0
+        dropzeros!(A)
+        if isconnected(A)
+            #add to test
+            eitest[test_edge_count] = ei1
+            ejtest[test_edge_count] = ej1
+            test_edge_count += 1
+        else
+            A[ei1,ej1] = 1
+            A[ej1,ei1] = 1
+        end
+        icounter += 1
+    end
+    @show test_edge_count-1
+    @show nz
+    eitest = eitest[1:test_edge_count-1]
+    ejtest = ejtest[1:test_edge_count-1]
+    Atest = sparse(eitest,ejtest,1,m,n)
+    Atest = max.(Atest,Atest')
+    # p = a[1:nz]
+    # cp = setdiff(collect(1:len),p);
+
+    # Rtrain = sparse(ei[p],ej[p],ev[p],m,n)
+    # Rtrain = max.(Rtrain,Rtrain')
+    # Rtest = sparse(ei[cp],ej[cp],ev[cp],m,n)
+    # Rtest = max.(Rtest,Rtest')
+    return A,Atest
+end
+
 function find_edges_of_tris(M)
     H1 = (M[4]'*M[5]).*M[2]'
     H3 = (M[2]'*M[5]').*M[4]'
@@ -275,9 +628,6 @@ end
 
 sample_experiment_ids(experiments_to_run::Int,total_experiments::Int) = sample(1:total_experiments,experiments_to_run,replace=false)
 
-
-
-
 # function double_seed(
 #   A::SparseMatrixCSC{Int64,Int64},
 #   v1::Int,
@@ -346,31 +696,172 @@ function _normout_colstochastic(P::SparseArrays.SparseMatrixCSC{T,Int64}) where 
   Q = SparseMatrixCSC(P.m,P.n,P.colptr,P.rowval,pv./colsums[pj])
 end
 
-# ,seedon)
-#   for v in seedon
-#     xsol = seeded_pagerank(triangles_collapsed,myalpha,v)
-#   end
 
+# how many triangles does a given edge close
+function close_triangles(i,j,Aref)
+    A = copy(Aref)
+    A[i,j]=1
+    A[j,i]=1
+    C1 = hcat(unzip_triangles(collect(triangles(A,i)))...)
+    C2 = hcat(unzip_triangles(collect(triangles(A,j)))...)
+    D1 = map(i->sort(C1[i,:]),1:size(C1,1))
+    D2 = map(i->sort(C2[i,:]),1:size(C2,1))
+    return length(intersect(D1,D2))
+end
 
+function findset(v1,n0)
+    if 1 <= v1 <= n0[1]
+        return 1:n0[1]
+    elseif n0[1]+1 <= v1 <= n0[2]+n0[1]
+        return n0[1]+1:n0[1]+n0[2]
+    elseif n0[1]+n0[2]+1 <= v1 <= sum(n0)
+        return n0[1]+n0[2]+1:sum(n0)
+    else
+        error("something's wrong")
+    end
+end
 
-# TR = spones(TR)
-# nrows,ncols = size(TR)
-# C = vcat(
-#         hcat(spzeros(Int64,nrows,nrows),TR),
-#         hcat(TR',spzeros(Int64,ncols,ncols))
-#         )
+function findremaining(v1,v2,n0)
+    f1 = findset(v1,n0)
+    f2 = findset(v2,n0)
+    ntoadd = setdiff(1:sum(n0),f1,f2)
+    ntoadd = ntoadd[1]-1
+    return ntoadd
+end
 
+function triangle_density(A)
+    Am = A^2
+    d = sum(Am)-sum(Diagonal(Am))
+    Am = A*Am
+    n = sum(Diagonal(Am))
+    return n/d
+end
 
-# Mtrain,Mtest = split_train_test(C,tao);
-# Ctest = Mtest[nrows+1:end,1:nrows]
+plot_mm(mm,ylabelval) = plot_mm(mm,ylabelval,:black)
 
+function plot_mm(mm,ylabelval,mylinecolor)
+pyplot()
+c1 = RGB(153/255,194/255,77/255)#g
+c2 = RGB(218/255,98/255,125/255)#r
+c3 = RGB(89/255, 60/255, 143/255)
+c4 = RGB(56/255, 245/255, 235/255)
 
-# seedon = 1:nrows
+aucvals = mm[:,[4,11]]
+Plots.boxplot(["Pairseed" "TRPR"],aucvals,legend = false,color=c1,alpha=0.6,xtickfont=font(10),linecolor=mylinecolor)
 
-# X = zeros(Float64,ncols,length(seedon));
+aucvals = mm[:,[7,8]]
+Plots.boxplot!(["MUL" "MAX"],aucvals,color=c2,alpha=0.6,linecolor=mylinecolor)
 
-# for i = 1:length(seedon)
-#   X[:,i] = seeded_pagerank(Mtrain,myalpha,seedon[i])[nrows+1:end]
-# end
-# tpr2,fpr2,auc2 = calc_AUC_new(Ctest,X); @show auc2
-# end
+aucvals = mm[:,[15,16,17]]
+Plots.boxplot!(["AA" "PA" "JS"],aucvals,color=c3,alpha=0.6,linecolor=mylinecolor)
+        
+aucvals = mm[:,[18,19,20,21]]
+Plots.boxplot!(["AA-MAX" "AA-MUL" "JS-MAX" "JS-MUL"],aucvals,color=c4,alpha=0.6,linecolor=mylinecolor)
+        
+aucvals = mm[:,[4,11,7,8,15,16,17,18,19,20,21]]
+ma(aucvals)
+Plots.plot!(ylim=(-0.2,1),yticks=0:0.2:1)
+Plots.ylabel!(ylabelval,size=(900,200),xtickfont=font(10))
+end
+
+function plot_mm!(mm,ylabelval,mylinecolor;labelnumber=true,lower_y_label=false)
+
+c1 = RGB(153/255,194/255,77/255)#g
+c2 = RGB(218/255,98/255,125/255)#r
+c3 = RGB(89/255, 60/255, 143/255)
+c4 = RGB(56/255, 245/255, 235/255)
+
+aucvals = mm[:,[4,11]]
+Plots.boxplot!(["Pairseed" "TRPR"],aucvals,legend = false,color=c1,alpha=0.6,xtickfont=font(10),linecolor=mylinecolor)
+
+aucvals = mm[:,[7,8]]
+Plots.boxplot!(["MUL" "MAX"],aucvals,color=c2,alpha=0.6,linecolor=mylinecolor)
+
+aucvals = mm[:,[15,16,17]]
+Plots.boxplot!(["AA" "PA" "JS"],aucvals,color=c3,alpha=0.6,linecolor=mylinecolor)
+        
+aucvals = mm[:,[18,19,20,21]]
+Plots.boxplot!(["AA-MAX" "AA-MUL" "JS-MAX" "JS-MUL"],aucvals,color=c4,alpha=0.6,linecolor=mylinecolor)
+        
+aucvals = mm[:,[4,11,7,8,15,16,17,18,19,20,21]]
+if labelnumber == true
+    ma(aucvals)
+end
+
+if lower_y_label == true
+    ytickslabels = ["LOETO",0,0.2,0.4,0.6,0.8,1]
+    Plots.plot!(ylim=(-0.2,1),yticks = ([-.1,0,0.2,0.4,0.6,0.8,1],ytickslabels))
+else
+    Plots.plot!(ylim=(-0.2,1),yticks=0:0.2:1)
+end
+Plots.ylabel!(ylabelval,size=(900,200),xtickfont=font(10))
+end
+
+function plot_mm2(mm,ylabelval,mylinecolor)
+pyplot()
+c1 = RGB(153/255,194/255,77/255)#g
+c2 = RGB(218/255,98/255,125/255)#r
+c3 = RGB(89/255, 60/255, 143/255)
+c4 = RGB(56/255, 245/255, 235/255)
+
+aucvals = mm[:,[4,11]]
+Plots.boxplot(["Pairseed" "TRPR"],aucvals,legend = false,color=c1,alpha=0.6,xtickfont=font(10),linecolor=mylinecolor)
+
+aucvals = mm[:,[7,8]]
+Plots.boxplot!(["MUL" "MAX"],aucvals,color=c2,alpha=0.6,linecolor=mylinecolor)
+
+aucvals = mm[:,[15,16,17]]
+Plots.boxplot!(["AA" "PA" "JS"],aucvals,color=c3,alpha=0.6,linecolor=mylinecolor)
+        
+aucvals = mm[:,[18,19,20,21]]
+Plots.boxplot!(["AA-MAX" "AA-MUL" "JS-MAX" "JS-MUL"],aucvals,color=c4,alpha=0.6,linecolor=mylinecolor)
+        
+aucvals = mm[:,[4,11,7,8,15,16,17,18,19,20,21]]
+ma2(aucvals)
+Plots.plot!(ylim=(-0.2,1),yticks=0:0.2:1)
+Plots.ylabel!(ylabelval,size=(900,200),xtickfont=font(10))
+end
+
+function plot_mm2!(mm,ylabelval,mylinecolor)
+c1 = RGB(153/255,194/255,77/255)#g
+c2 = RGB(218/255,98/255,125/255)#r
+c3 = RGB(89/255, 60/255, 143/255)
+c4 = RGB(56/255, 245/255, 235/255)
+
+aucvals = mm[:,[4,11]]
+Plots.boxplot!(["Pairseed" "TRPR"],aucvals,legend = false,color=c1,alpha=0.6,xtickfont=font(10),linecolor=mylinecolor)
+
+aucvals = mm[:,[7,8]]
+Plots.boxplot!(["MUL" "MAX"],aucvals,color=c2,alpha=0.6,linecolor=mylinecolor)
+
+aucvals = mm[:,[15,16,17]]
+Plots.boxplot!(["AA" "PA" "JS"],aucvals,color=c3,alpha=0.6,linecolor=mylinecolor)
+        
+aucvals = mm[:,[18,19,20,21]]
+Plots.boxplot!(["AA-MAX" "AA-MUL" "JS-MAX" "JS-MUL"],aucvals,color=c4,alpha=0.6,linecolor=mylinecolor)
+        
+aucvals = mm[:,[4,11,7,8,15,16,17,18,19,20,21]]
+ma2(aucvals)
+Plots.plot!(ylim=(-0.2,1),yticks=0:0.2:1)
+Plots.ylabel!(ylabelval,size=(900,200),xtickfont=font(10))
+end
+
+function ma2(aucvals)
+    xstart = 0.5
+    m = median(aucvals,dims=1)
+    m = round.(m,digits=2)
+    for i = 1:length(m)
+        StatsPlots.annotate!([(xstart,m[i]+0.05,text(m[i],12,:center))])
+        xstart += 1.4
+    end
+end
+
+function ma(aucvals)
+    xstart = 0.5
+    m = median(aucvals,dims=1)
+    m = round.(m,digits=2)
+    for i = 1:length(m)
+        StatsPlots.annotate!([(xstart,-.1,text(m[i],12,:center))])
+        xstart += 1.4
+    end
+end
